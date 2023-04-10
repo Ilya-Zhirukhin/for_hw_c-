@@ -1,0 +1,6 @@
+jpg:Images
+png:Images
+mp3:Music
+txt:Docs
+ext:Other
+docx:Docs
