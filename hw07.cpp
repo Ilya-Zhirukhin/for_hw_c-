@@ -1,201 +1,342 @@
-
-
-#include <iostream>
 #include <boost/asio.hpp>
 #include <boost/bind.hpp>
 
-    using boost::asio::ip::tcp;
-
-    class Session : public std::enable_shared_from_this<Session> {
-    public:
-        Session(tcp::socket socket) : socket_(std::move(socket)) {}
-
-        void start() {
-            doRead();
-        }
-
-    private:
-        void doRead() {
-            auto self(shared_from_this());
-            boost::asio::async_read_until(socket_, buffer_, '\n',
-                                          [this, self](boost::system::error_code ec, std::size_t /*length*/) {
-                                              if (!ec) {
-                                                  std::istream is(&buffer_);
-                                                  std::string command;
-                                                  std::getline(is, command);
-
-                                                  // Обработка команды
-                                                  std::string response = processCommand(command);
-
-                                                  boost::asio::async_write(socket_, boost::asio::buffer(response),
-                                                                           [this, self](boost::system::error_code ec,
-                                                                                        std::size_t /*length*/) {
-                                                                               if (!ec) {
-                                                                                   doRead();
-                                                                               }
-                                                                           });
-                                              }
-                                          });
-        }
-
 #include <iostream>
+#include <list>
+#include <memory>
 #include <fstream>
-
 #include <sstream>
+#include <chrono>
 #include <boost/filesystem.hpp>
+#include <limits>
 
-std::string processCommand(const std::string &command) {
-    std::istringstream iss(command);
-    std::string cmd;
-    iss >> cmd;
 
-    if (cmd == "username") {
-        // Команда: username
-        // Возвращает имя пользователя
-        return "Username: " + std::string(getenv("USER")) + "\n";
-    } else if (cmd == "hostname") {
-        // Команда: hostname
-        // Возвращает имя компьютера
-        return "Hostname: " + boost::asio::ip::host_name() + "\n";
-    } else if (cmd == "serverdatetime") {
-        // Команда: serverdatetime
-        // Возвращает время и дату на сервере
-        std::time_t now = std::time(nullptr);
-        std::string dateTime = std::ctime(&now);
-        return "Server Date and Time: " + dateTime + "\n";
-    } else if (cmd == "ls") {
-        // Команда: ls <directory_path>
-        // Возвращает содержимое указанной папки на сервере
-        std::string directory;
-        iss >> directory;
 
-        boost::filesystem::directory_iterator end_itr;
-        std::ostringstream oss;
-        for (boost::filesystem::directory_iterator itr(directory); itr != end_itr; ++itr) {
-            oss << itr->path().filename().string() << "\n";
-        }
+using btcp = boost::asio::ip::tcp;
 
-        return oss.str();
-    } else if (cmd == "mkfile") {
-        // Команда: mkfile <file_path>
-        // Создает файл на сервере
-        std::string filePath;
-        iss >> filePath;
+struct Connection
+{
+    btcp::socket socket;
+    boost::asio::streambuf read_buffer;
+    Connection(boost::asio::io_service &io_service) : socket(io_service), read_buffer() {}
+};
 
-        std::ofstream file(filePath);
-        if (file) {
-            file.close();
-            return "File created: " + filePath + "\n";
-        } else {
-            return "Failed to create file: " + filePath + "\n";
-        }
-    } else if (cmd == "mkdir") {
-        // Команда: mkdir <directory_path>
-        // Создает папку на сервере
-        std::string directoryPath;
-        iss >> directoryPath;
+class Server
+{
+    boost::asio::io_service ioservice;
+    btcp::acceptor acceptor;
+    std::list<Connection> connections;
 
-        if (boost::filesystem::create_directory(directoryPath)) {
-            return "Directory created: " + directoryPath + "\n";
-        } else {
-            return "Failed to create directory: " + directoryPath + "\n";
-        }
-    } else if (cmd == "rmfile") {
-        // Команда: rmfile <file_path>
-        // Удаляет файл на сервере
-        std::string filePath;
-        iss >> filePath;
+public:
+    Server(uint16_t port) : acceptor(ioservice, btcp::endpoint(btcp::v4(), port)) { start_accept(); }
 
-        if (boost::filesystem::remove(filePath)) {
-            return "File removed: " + filePath + "\n";
-        } else {
-            return "Failed to remove file: " + filePath + "\n";
-        }
-    } else if (cmd == "rmdir") {
-        // Команда: rmdir <directory_path>
-        // Удаляет папку на сервере
-        std::string directoryPath;
-        iss >> directoryPath;
+    void on_read(std::list<Connection>::iterator con_handle, boost::system::error_code const &err, size_t bytes_transfered)
+    {
+        if (bytes_transfered > 0)
+        {
+            std::istream is(&con_handle->read_buffer);
+            std::string line;
+            std::getline(is, line);
 
-        if (boost::filesystem::remove_all(directoryPath)) {
-            return "Directory removed: " + directoryPath + "\n";
-
+            std::string response;
+            if (line == "username")
+            {
+                response = "Username: John Doe\n";
+            }
+            else if (line == "hostname")
+            {
+                response = "Hostname: MyServer\n";
+            }
+            else if (line == "serverdatetime")
+            {
+                auto now = std::chrono::system_clock::now();
+                auto time = std::chrono::system_clock::to_time_t(now);
+                response = "Server Date and Time: " + std::string(std::ctime(&time));
+            }
+            else if (line.find("ls") == 0)
+            {
+                std::string path = line.substr(3);
+                response = listDirectoryContents(path);
+            }
+            else if (line.find("mkfile") == 0)
+            {
+                std::string filename = line.substr(7);
+                response = createFile(filename);
+            }
+            else if (line.find("mkdir") == 0)
+            {
+                std::string dirname = line.substr(6);
+                response = createDirectory(dirname);
+            }
+            else if (line.find("rmfile") == 0)
+            {
+                std::string filename = line.substr(7);
+                response = removeFile(filename);
+            }
+            else if (line.find("rmdir") == 0)
+            {
+                std::string dirname = line.substr(6);
+                response = removeDirectory(dirname);
+            }
+            else if (line.find("readfile") == 0)
+            {
+                std::string params = line.substr(9);
+                std::istringstream iss(params);
+                std::string filename;
+                size_t bytes = std::numeric_limits<size_t>::max();
+                if (!(iss >> filename))
+                {
+                    response = "Invalid parameters for readfile command";
+                }
+                else if (iss >> bytes)
+                {
+                    response = readFile(filename, bytes);
+                }
+                else
+                {
+                    response = readFile(filename);
+                }
+            }
+            else if (line == "quit")
+            {
+                response = "Goodbye!\n";
+                con_handle->socket.close();
+            }
             else
             {
-                return "Failed to remove directory: " + directoryPath + "\n";
+                response = "Invalid command\n";
             }
-        } else if (cmd == "readfile") {
-            // Команда: readfile <file_path> [<bytes>]
-            // Читает содержимое файла на сервере
-            std::string filePath;
-            iss >> filePath;
 
-            std::ifstream file(filePath, std::ios::binary);
-            if (file) {
-                // Чтение указанного количества байт или всего файла (по умолчанию)
-                std::size_t bytes = std::numeric_limits<std::size_t>::max();
-                iss >> bytes;
+            boost::asio::async_write(con_handle->socket, boost::asio::buffer(response),
+                                     boost::bind(&Server::on_write, this, con_handle, response,
+                                                 boost::asio::placeholders::error));
+        }
 
-                std::ostringstream oss;
-                char buffer[4096];
-                std::size_t bytesRead = 0;
-
-                while (bytesRead < bytes && file.read(buffer, sizeof(buffer))) {
-                    oss.write(buffer, file.gcount());
-                    bytesRead += file.gcount();
-                }
-
-                return oss.str();
-            } else {
-                return "Failed to read file: " + filePath + "\n";
-            }
-        } else if (cmd == "quit") {
-            // Команда: quit
-            // Завершает сеанс
-            return "Goodbye!\n";
-        } else {
-            // Неизвестная команда
-            return "Unknown command: " + cmd + "\n";
+        if (err)
+        {
+            std::cerr << "Error: " << err.message() << std::endl;
+            connections.erase(con_handle);
         }
     }
 
+    void do_async_read(std::list<Connection>::iterator con_handle)
+    {
+        auto handler = boost::bind(&Server::on_read, this, con_handle, boost::asio::placeholders::error, boost::asio::placeholders::bytes_transferred);
+        boost::asio::async_read_until(con_handle->socket, con_handle->read_buffer, "\n", handler);
+    }
 
-    tcp::socket socket_;
-    boost::asio::streambuf buffer_;
+    void on_write(std::list<Connection>::iterator con_handle, std::string response, boost::system::error_code const &err)
+    {
+        if (!err)
+        {
+            std::cout << "Response sent: " << response;
+        }
+        else
+        {
+            std::cerr << "Error: " << err.message() << std::endl;
+            connections.erase(con_handle);
+        }
+    }
+
+    void on_accept(std::list<Connection>::iterator con_handle, boost::system::error_code const &err)
+    {
+        if (!err)
+        {
+            std::cout << "Connection from: " << con_handle->socket.remote_endpoint().address().to_string() << "\n";
+            std::cout << "Sending welcome message\n";
+            std::string welcomeMsg = "Welcome to the server!\n";
+            boost::asio::async_write(con_handle->socket, boost::asio::buffer(welcomeMsg),
+                                     boost::bind(&Server::on_write, this, con_handle, welcomeMsg,
+                                                 boost::asio::placeholders::error));
+            do_async_read(con_handle);
+        }
+        else
+        {
+            std::cerr << "Error: " << err.message() << std::endl;
+            connections.erase(con_handle);
+        }
+        start_accept();
+    }
+
+    void start_accept()
+    {
+        auto con_handle = connections.emplace(connections.begin(), ioservice);
+        auto handler = boost::bind(&Server::on_accept, this, con_handle, boost::asio::placeholders::error);
+        acceptor.async_accept(con_handle->socket, handler);
+    }
+
+    std::string listDirectoryContents(const std::string &path)
+{
+    std::stringstream response;
+    try
+    {
+        boost::filesystem::path directoryPath(path);
+        if (boost::filesystem::exists(directoryPath) && boost::filesystem::is_directory(directoryPath))
+        {
+            boost::filesystem::directory_iterator endIterator;
+            for (boost::filesystem::directory_iterator dirIterator(directoryPath); dirIterator != endIterator; ++dirIterator)
+            {
+                response << dirIterator->path().filename().string() << "\n";
+            }
+        }
+        else
+        {
+            response << "Invalid directory path: " << path << "\n";
+        }
+    }
+    catch (const boost::filesystem::filesystem_error &ex)
+    {
+        response << "Error: " << ex.what() << "\n";
+    }
+    return response.str();
+}
+
+std::string createFile(const std::string &filename)
+{
+    std::stringstream response;
+    try
+    {
+        std::ofstream file(filename);
+        if (file)
+        {
+            response << "File created: " << filename << "\n";
+        }
+        else
+        {
+            response << "Failed to create file: " << filename << "\n";
+        }
+    }
+    catch (const std::exception &ex)
+    {
+        response << "Error: " << ex.what() << "\n";
+    }
+    return response.str();
+}
+
+std::string createDirectory(const std::string &dirname)
+{
+    std::stringstream response;
+    try
+    {
+        if (boost::filesystem::create_directory(dirname))
+        {
+            response << "Directory created: " << dirname << "\n";
+        }
+        else
+        {
+            response << "Failed to create directory: " << dirname << "\n";
+        }
+    }
+    catch (const boost::filesystem::filesystem_error &ex)
+    {
+        response << "Error: " << ex.what() << "\n";
+    }
+    return response.str();
+}
+
+std::string removeFile(const std::string &filename)
+{
+    std::stringstream response;
+    try
+    {
+        if (boost::filesystem::remove(filename))
+        {
+            response << "File removed: " << filename << "\n";
+        }
+        else
+        {
+            response << "Failed to remove file: " << filename << "\n";
+        }
+    }
+    catch (const boost::filesystem::filesystem_error &ex)
+    {
+        response << "Error: " << ex.what() << "\n";
+    }
+    return response.str();
+}
+
+std::string removeDirectory(const std::string &dirname)
+{
+    std::stringstream response;
+    try
+    {
+        if (boost::filesystem::remove_all(dirname) > 0)
+        {
+            response << "Directory removed: " << dirname << "\n";
+        }
+        else
+        {
+            response << "Failed to remove directory: " << dirname << "\n";
+        }
+    }
+    catch (const boost::filesystem::filesystem_error &ex)
+    {
+        response << "Error: " << ex.what() << "\n";
+    }
+    return response.str();
+}
+
+std::string readFile(const std::string &filename, size_t bytes)
+{
+    std::ifstream file(filename, std::ios::binary);
+    if (!file)
+    {
+        return "Failed to open file: " + filename + "\n";
+    }
+
+    std::stringstream response;
+    response << "File contents: " << filename << "\n";
+
+    // Read 'bytes' number of bytes from the file and append to the response
+    char buffer[1024];
+    size_t totalBytesRead = 0;
+    while (bytes > 0)
+    {
+        size_t bytesRead = std::min(bytes, sizeof(buffer));
+        file.read(buffer, bytesRead);
+
+        if (file.bad())
+        {
+            response << "Error while reading file: " << filename << "\n";
+            break;
+        }
+
+        if (file.eof())
+        {
+            response << buffer;
+            break;
+        }
+
+        response.write(buffer, bytesRead);
+        totalBytesRead += bytesRead;
+        bytes -= bytesRead;
+    }
+}
+
+
+
+
+    if (totalBytesRead == 0)
+    {
+        response << "Empty file: " << filename << "\n";
+    }
+
+    return response.str();
+}
+
+
+
+    void run()
+    {
+        ioservice.run();
+    }
 };
 
-class Server {
-public:
-    Server(boost::asio::io_context &io_context, short port)
-            : acceptor_(io_context, tcp::endpoint(tcp::v4(), port)) {
-        doAccept();
-    }
-
-private:
-    void doAccept() {
-        acceptor_.async_accept(
-                [this](boost::system::error_code ec, tcp::socket socket) {
-                    if (!ec) {
-                        std::make_shared<Session>(std::move(socket))->start();
-                    }
-
-                    doAccept();
-                });
-    }
-
-    tcp::acceptor acceptor_;
-};
-
-int main() {
-    try {
-        boost::asio::io_context io_context;
-        Server server(io_context, 12345);
-        io_context.run();
-    }
-    catch (const std::exception &e) {
-        std::cerr << "Exception: " << e.what() << std::endl;
-    }
-
+int main()
+{
+    Server srv(12345);
+    srv.run();
     return 0;
 }
+
 
